@@ -1,0 +1,236 @@
+
+
+#include <stdio.h>
+#include <cdefBF706.h>
+#include <defBF706.h>
+#include "stdfix.h"
+#include <sys/platform.h>
+#include "adi_initialize.h"
+#include <services/int/adi_int.h>
+#include <services/gpio/adi_gpio.h>
+#include <math.h>
+
+
+
+#define BUFFER_SIZE 2                                     // Size of buffer to transmit
+#define CLIP 0.01
+#define FUZZ_GAIN 4
+#define SINE_GAIN_A 0.1
+#define SINE_GAIN_B 1.5
+#define POLY_A 5                                          //coefficient of polynomial
+#define POLY_B 10                                         //coefficient of polynomial
+#define MASK 0x04                                         //bit 3
+#define metalgain 1.5                                     // coefficient of metal effect
+#define ELECTRIC_GAIN 12.0f
+#define M_PI 3.14159265358979323846
+
+long fract XIN[BUFFER_SIZE];                              // Input buffer
+long fract YOUT[BUFFER_SIZE];                             // Output buffer
+long fract clipgain = 0.00015;                             //threshold for clipping
+long fract polyclip = 0.001;                              //threshold for clipping in poly
+long fract softclip = 0.000225;                           //threshold for softclipping
+
+volatile int distortion_mode = 0;                         //0 for default mode
+
+
+void button_configure(void);
+//void button_handler(uint32_t iid, void *handlerArg);
+void TWI_write(uint16_t, uint8_t);
+void codec_configure(void);
+void sport_configure(void);
+void init_SPORT_DMA(void);
+void SPORT0_RX_interrupt_handler(uint32_t iid, void *handlerArg);
+
+// Subroutine DMA_init initialises the SPORT0 DMA0 and DMA1 in auto-buffer mode, p19–39 and p19–49, BHRM.
+
+
+
+long fract clipping(long fract sample) {
+
+	if (sample > clipgain)
+	        return clipgain;
+	    else if (sample < -clipgain)
+	        return -clipgain;
+	    else
+	        return sample;
+
+}
+
+long fract apply_gain(long fract sample){
+	 sample = sample * FUZZ_GAIN;
+	 return sample;
+}
+
+
+long fract softclipping(long fract sample) {
+	if (sample > clipgain)
+		        return softclip;
+		    else if (sample < -clipgain)
+		        return -softclip;
+		    else
+		        return sample;
+}
+
+long fract sine_function(long fract sample){
+	sample = SINE_GAIN_A * sin(SINE_GAIN_B * sample);
+	return sample;
+}
+
+long fract polyfunction(long fract sample){
+	sample = (POLY_A * pow(sample, 2)) + (POLY_B * sample);
+	if (sample > polyclip)
+			        return polyclip;
+			    else if (sample < -polyclip)
+			        return -polyclip;
+			    else
+			        return sample;
+}
+
+long fract electric_function(long fract sample)
+{
+    float input  = (float) sample;
+    float output = (2.0f / (float)M_PI) * atanf(ELECTRIC_GAIN * input);
+    return (long fract)output;
+}
+
+void init_SPORT_DMA()
+{
+ *pREG_DMA0_ADDRSTART = YOUT;                             // points to start of SPORT0_A buffer
+ *pREG_DMA0_XCNT = BUFFER_SIZE;                           // no. of words to transmit
+ *pREG_DMA0_XMOD = 4;                                     // Word length, increment to find next word
+ *pREG_DMA1_ADDRSTART = XIN;                              // points to start of SPORT0_B buffer
+ *pREG_DMA1_XCNT = BUFFER_SIZE;                           // no. of words to receive
+ *pREG_DMA1_XMOD = 4;                                     // Word length, increment to find the next word
+ *pREG_DMA0_CFG = 0x00001221;                             // SPORT0 TX, FLOW = autobuffer, MSIZE = PSIZE = 4
+ *pREG_DMA1_CFG = 0x00101223;                             // SPORT0 RX, DMA interrupt when x count expires
+}
+
+// Function SPORT0_RX_interrupt_handler is called when left and right audio samples have been received.
+// The inputs are held in XIN[0]and XIN[1] the outputs are sent to YIN[0] and YIN[1].
+
+void SPORT0_RX_interrupt_handler(uint32_t iid, void *handlerArg)
+{
+  *pREG_DMA1_STAT = 0x1;                                  // Clear interrupt
+
+  switch (distortion_mode) {
+         case 0:
+
+        	 YOUT[0] = XIN[0];
+        	 YOUT[1] = XIN[1];
+        	 //printf("Input is %d and %d\n", XIN[0], XIN[1]);
+        	 //printf("Output is %d and %d\n", YOUT[0], YOUT[1]);
+        	 //printf("Clipgain is %d\n", clipgain);
+        	 break;
+         case 1:
+             YOUT[0] = polyfunction(XIN[0]);
+             YOUT[1] = polyfunction(XIN[1]);
+             break;
+         case 2:
+             YOUT[0] = softclipping(XIN[0]);
+             YOUT[1] = softclipping(XIN[1]);
+             break;
+         case 3:
+        	 YOUT[0] = clipping(XIN[0]);
+        	 YOUT[1] = clipping(XIN[1]);
+        	 break;
+     }
+
+
+
+}
+
+// Function sport_configure initialises the SPORT0. Refer to pages 26-59, 26-67,
+// 26-75 and 26-76 of the ADSP-BF70x Blackfin+ Processor Hardware Reference manual.
+
+void sport_configure()
+{
+ *pREG_PORTC_FER=0x0003F0;                                // Set up Port C in peripheral mode
+ *pREG_PORTC_FER_SET=0x0003F0;                            // Set up Port C in peripheral mode
+ *pREG_SPORT0_CTL_A=0x2001973;                            // Set up SPORT0 (A) as TX to codec, 24 bits
+ *pREG_SPORT0_DIV_A=0x400001;                             // 64 bits per frame, clock divisor of 1
+ *pREG_SPORT0_CTL_B=0x0001973;                            // Set up SPORT0 (B) as RX from codec, 24 bits
+ *pREG_SPORT0_DIV_B=0x400001;                             // 64 bits per frame, clock divisor of 1
+}
+
+// Function TWI_write is a simple driver for the TWI. Refer to page 24-15 onwards
+// of the ADSP-BF70x Blackfin+ Processor Hardware Reference manual.
+
+void TWI_write(uint16_t reg_add, uint8_t reg_data)
+{
+  int n;
+  reg_add=(reg_add<<8)|(reg_add>>8);                      // Reverse low order and high order bytes
+  *pREG_TWI0_CLKDIV=0x3232;                               // Set duty cycle
+  *pREG_TWI0_CTL=0x8c;                                    // Set prescale and enable TWI
+  *pREG_TWI0_MSTRADDR=0x38;                               // Address of codec
+  *pREG_TWI0_TXDATA16=reg_add;                            // Address of register to set, LSB then MSB
+  *pREG_TWI0_MSTRCTL=0xc1;                                // Command to send three bytes and enable transmit
+  for(n=0;n<8000;n++){}                                   // Delay since codec must respond
+  *pREG_TWI0_TXDATA8= reg_data;                            // Data to write
+  for(n=0;n<10000;n++){}                                  // Delay
+  *pREG_TWI0_ISTAT=0x050;                                 // Clear TXERV interrupt
+  for(n=0;n<10000;n++){}                                  // Delay
+  *pREG_TWI0_ISTAT=0x010;                                 // Clear MCOMP interrupt
+}
+
+// Function codec_configure initialises the ADAU1761 codec. Refer to the control register
+// descriptions, page 51 onwards of the ADAU1761 data sheet.
+
+void codec_configure()
+{
+  TWI_write(0x4000, 0x01);                                // Enable master clock, disable PLL
+  TWI_write(0x40F9, 0x7f);                                // Enable all clocks
+  TWI_write(0x40Fa, 0x03);                                // Enable all clocks
+  TWI_write(0x4015, 0x01);                                // Set serial port master mode
+  TWI_write(0x4019, 0x13);                                // Set ADC to on, both channels
+  TWI_write(0x401c, 0x21);                                // Enable left channel mixer
+  TWI_write(0x401e, 0x41);                                // Enable right channel mixer
+  TWI_write(0x4029, 0x03);                                // Turn on power, both channels
+  TWI_write(0x402A, 0x03);                                // Set both DACs on
+  TWI_write(0x40f2, 0x01);                                // DAC gets L, R input from serial port
+  TWI_write(0x40f3, 0x01);                                // ADC sends L, R input to serial port
+  TWI_write(0x400a, 0x0b);                                // Set left line-in gain to 0 dB
+  TWI_write(0x400c, 0x0b);                                // Set right line-in gain to 0 dB
+  TWI_write(0x4023, 0xe7);	                            // Set left headphone volume to 0 dB
+  TWI_write(0x4024, 0xe7);                                // Set right headphone volume to 0 dB
+  TWI_write(0x4017, 0x00);                                // Set codec default sample rate, 48 kHz
+}
+
+void button_configure()
+{
+    adi_gpio_Init(NULL, NULL, NULL);                      //initialize gpio
+    adi_gpio_SetDirection(ADI_GPIO_PORT_C, ADI_GPIO_PIN_2, ADI_GPIO_DIRECTION_INPUT); //set push button as input
+}
+
+//void button_handler(uint32_t iid, void *handlerArg) {
+//    distortion_mode = (distortion_mode + 1) % 3;
+//}
+
+
+int main(void)
+{
+ bool my_audio = true;
+ uint32_t button_state;
+ uint32_t prev_button_state = 0;
+ int counter = 0;
+
+ codec_configure();                                       // Enable codec, sport, DMA and push button
+ sport_configure();
+ init_SPORT_DMA();
+ button_configure();
+ adi_int_InstallHandler(INTR_SPORT0_B_DMA, SPORT0_RX_interrupt_handler, 0, true);
+     //printf("Input is %d and %d\n", XIN[0], XIN[1]);
+     //printf("Output is %d and %d\n", YOUT[0], YOUT[1]);
+     //printf("Clipgain is %d\n", clipgain);
+ *pREG_SEC0_GCTL  = 1;                                    // Enable the System Event Controller (SEC)
+ *pREG_SEC0_CCTL0 = 1;                                    // Enable SEC Core Interface (SCI)
+ while(my_audio){
+	  adi_gpio_GetData(ADI_GPIO_PORT_C, &button_state);                //check the state of the push button
+	 	 if (!(button_state & MASK)) {
+	 		distortion_mode = (distortion_mode + 1) % 4;
+	 	       for (volatile int i = 0; i < 6000000; i++);
+	 	 }
+
+ };
+
+
+}
